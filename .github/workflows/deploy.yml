@@ -82,13 +82,13 @@ jobs:
 
     - name: Get existing cluster ID
       run: |
-        CLUSTER_NAME="ClusterSD"
+        CLUSTER_NAME=$(echo "ClusterSD" | tr -d '\r\n')
 
         clusters_response=$(curl -s -X GET \
           -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
           "${{ env.DEST_HOST }}/api/2.0/clusters/list")
 
-        cluster_id=$(echo "$clusters_response" | jq -r --arg name "$CLUSTER_NAME" '.clusters[]? | select(.cluster_name == $name) | .cluster_id')
+        cluster_id=$(echo "$clusters_response" | tr -d '\r' | jq -r --arg name "$CLUSTER_NAME" '.clusters[]? | select(.cluster_name == $name) | .cluster_id')
 
         if [ "$cluster_id" != "" ] && [ "$cluster_id" != "null" ]; then
           echo "Cluster encontrado: $CLUSTER_NAME con ID: $cluster_id"
