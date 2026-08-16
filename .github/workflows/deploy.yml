@@ -1,0 +1,236 @@
+name: Deploy y Ejecucion ETL Instacart Ecommerce
+
+on:
+  push:
+    branches:
+      - main
+      - dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v3
+
+    - name: Install jq & curl
+      run: sudo apt-get update && sudo apt-get install -y jq curl
+
+    - name: Set environment variables based on branch
+      run: |
+        if [ "${{ github.ref_name }}" = "main" ]; then
+          echo "Ambiente: PRODUCCION"
+          echo "DEST_HOST=${{ secrets.DATABRICKS_HOST }}" >> $GITHUB_ENV
+          echo "DEST_TOKEN=${{ secrets.DATABRICKS_TOKEN }}" >> $GITHUB_ENV
+          echo "DEST_BASE=/Workspace/Shared/instacart_ecommerce_etl_prod" >> $GITHUB_ENV
+          echo "WORKFLOW_NAME=WF_Instacart_Ecommerce_ETL_PROD" >> $GITHUB_ENV
+          echo "ENVIRONMENT=production" >> $GITHUB_ENV
+        else
+          echo "Ambiente: DESARROLLO"
+          echo "DEST_HOST=${{ secrets.DATABRICKS_DEV_HOST }}" >> $GITHUB_ENV
+          echo "DEST_TOKEN=${{ secrets.DATABRICKS_DEV_TOKEN }}" >> $GITHUB_ENV
+          echo "DEST_BASE=/Workspace/Shared/instacart_ecommerce_etl_dev" >> $GITHUB_ENV
+          echo "WORKFLOW_NAME=WF_Instacart_Ecommerce_ETL_DEV" >> $GITHUB_ENV
+          echo "ENVIRONMENT=development" >> $GITHUB_ENV
+        fi
+
+    - name: Deploy notebooks to Databricks Workspace
+      run: |
+        echo "Creando carpeta ${{ env.DEST_BASE }} si no existe..."
+        curl -s -X POST \
+          -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"path\":\"${{ env.DEST_BASE }}\"}" \
+          "${{ env.DEST_HOST }}/api/2.0/workspace/mkdirs"
+
+        NOTEBOOKS=("01_bronze_extract" "02_silver_transform" "03_golden_load")
+
+        for nb in "${NOTEBOOKS[@]}"; do
+          file="proceso/${nb}.py"
+          dest_path="${{ env.DEST_BASE }}/$nb"
+          echo "Importando $file -> $dest_path"
+          response=$(curl -s -X POST \
+            -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+            -H "Content-Type: multipart/form-data" \
+            -F "path=$dest_path" \
+            -F "format=SOURCE" \
+            -F "language=PYTHON" \
+            -F "overwrite=true" \
+            -F "content=@$file" \
+            "${{ env.DEST_HOST }}/api/2.0/workspace/import")
+          echo "Response: $response"
+        done
+
+    - name: Check if workflow exists and delete if necessary
+      run: |
+        workflows_response=$(curl -s -X GET \
+          -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+          "${{ env.DEST_HOST }}/api/2.1/jobs/list")
+
+        existing_job_id=$(echo "$workflows_response" | jq -r --arg name "${{ env.WORKFLOW_NAME }}" '.jobs[]? | select(.settings.name == $name) | .job_id')
+
+        if [ "$existing_job_id" != "" ] && [ "$existing_job_id" != "null" ]; then
+          echo "Workflow encontrado con ID: $existing_job_id. Eliminando..."
+          curl -s -X POST \
+            -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"job_id\": $existing_job_id}" \
+            "${{ env.DEST_HOST }}/api/2.1/jobs/delete"
+        else
+          echo "No se encontro workflow existente."
+        fi
+
+    - name: Get existing cluster ID
+      run: |
+        CLUSTER_NAME="ClusterSD"
+
+        clusters_response=$(curl -s -X GET \
+          -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+          "${{ env.DEST_HOST }}/api/2.0/clusters/list")
+
+        cluster_id=$(echo "$clusters_response" | jq -r --arg name "$CLUSTER_NAME" '.clusters[]? | select(.cluster_name == $name) | .cluster_id')
+
+        if [ "$cluster_id" != "" ] && [ "$cluster_id" != "null" ]; then
+          echo "Cluster encontrado: $CLUSTER_NAME con ID: $cluster_id"
+          echo "CLUSTER_ID=$cluster_id" >> $GITHUB_ENV
+        else
+          echo "No se encontro el cluster: $CLUSTER_NAME"
+          echo "$clusters_response" | jq -r '.clusters[]? | .cluster_name'
+          exit 1
+        fi
+
+    - name: Create Databricks Workflow
+      run: |
+        cat > workflow_config.json << EOF
+        {
+          "name": "${{ env.WORKFLOW_NAME }}",
+          "format": "MULTI_TASK",
+          "tasks": [
+            {
+              "task_key": "bronze_extract",
+              "notebook_task": {
+                "notebook_path": "${{ env.DEST_BASE }}/01_bronze_extract",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "${{ env.CLUSTER_ID }}",
+              "timeout_seconds": 3600,
+              "max_retries": 1
+            },
+            {
+              "task_key": "silver_transform",
+              "notebook_task": {
+                "notebook_path": "${{ env.DEST_BASE }}/02_silver_transform",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "${{ env.CLUSTER_ID }}",
+              "timeout_seconds": 3600,
+              "max_retries": 1,
+              "depends_on": [{ "task_key": "bronze_extract" }]
+            },
+            {
+              "task_key": "golden_load",
+              "notebook_task": {
+                "notebook_path": "${{ env.DEST_BASE }}/03_golden_load",
+                "source": "WORKSPACE"
+              },
+              "existing_cluster_id": "${{ env.CLUSTER_ID }}",
+              "timeout_seconds": 3600,
+              "max_retries": 1,
+              "depends_on": [{ "task_key": "silver_transform" }]
+            }
+          ],
+          "email_notifications": {},
+          "webhook_notifications": {},
+          "timeout_seconds": 7200,
+          "max_concurrent_runs": 1,
+          "tags": {
+            "environment": "${{ env.ENVIRONMENT }}",
+            "created_by": "github_actions",
+            "project": "instacart_ecommerce_etl",
+            "cluster_used": "ClusterSD"
+          }
+        }
+        EOF
+
+        create_response=$(curl -s -X POST \
+          -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d @workflow_config.json \
+          "${{ env.DEST_HOST }}/api/2.1/jobs/create")
+
+        echo "Workflow creation response: $create_response"
+
+        job_id=$(echo "$create_response" | jq -r '.job_id')
+
+        if [ "$job_id" != "" ] && [ "$job_id" != "null" ]; then
+          echo "Workflow creado exitosamente con ID: $job_id"
+          echo "JOB_ID=$job_id" >> $GITHUB_ENV
+        else
+          echo "Error al crear el workflow"
+          exit 1
+        fi
+
+    - name: Execute Workflow
+      run: |
+        run_response=$(curl -s -X POST \
+          -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"job_id\": ${{ env.JOB_ID }}}" \
+          "${{ env.DEST_HOST }}/api/2.1/jobs/run-now")
+
+        run_id=$(echo "$run_response" | jq -r '.run_id')
+
+        if [ "$run_id" != "" ] && [ "$run_id" != "null" ]; then
+          echo "Workflow ejecutado. Run ID: $run_id"
+          echo "RUN_ID=$run_id" >> $GITHUB_ENV
+          echo "URL: ${{ env.DEST_HOST }}/jobs/${{ env.JOB_ID }}/runs/$run_id"
+        else
+          echo "Error al ejecutar el workflow"
+          echo "Response: $run_response"
+          exit 1
+        fi
+
+    - name: Monitor Workflow Execution
+      run: |
+        max_wait_time=900
+        wait_time=0
+        check_interval=30
+
+        while [ $wait_time -lt $max_wait_time ]; do
+          run_status=$(curl -s -X GET \
+            -H "Authorization: Bearer ${{ env.DEST_TOKEN }}" \
+            "${{ env.DEST_HOST }}/api/2.1/jobs/runs/get?run_id=${{ env.RUN_ID }}")
+
+          state=$(echo "$run_status" | jq -r '.state.life_cycle_state')
+          result_state=$(echo "$run_status" | jq -r '.state.result_state // "RUNNING"')
+
+          echo "Estado actual: $state ($result_state) - Tiempo: ${wait_time}s"
+
+          case "$state" in
+            "TERMINATED")
+              if [ "$result_state" = "SUCCESS" ]; then
+                echo "Workflow completado exitosamente!"
+                exit 0
+              else
+                echo "Workflow termino con errores: $result_state"
+                exit 1
+              fi
+              ;;
+            "INTERNAL_ERROR"|"SKIPPED")
+              echo "Workflow fallo con estado: $state"
+              exit 1
+              ;;
+            *)
+              echo "Workflow aun ejecutandose..."
+              ;;
+          esac
+
+          sleep $check_interval
+          wait_time=$((wait_time + check_interval))
+        done
+
+        echo "Timeout: el workflow sigue corriendo. Revisar en Databricks."
+        exit 0
+
+    - name: Clean up
+      run: rm -f workflow_config.json
